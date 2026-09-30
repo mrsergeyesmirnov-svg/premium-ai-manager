@@ -80,8 +80,10 @@ def extract_business_message(update: dict) -> BusinessMessage | None:
     return BusinessMessage(chat_id, message["text"].strip(), connection_id)
 
 
-def allowed_chat_ids() -> set[int]:
-    raw = os.getenv("ALLOWED_CHAT_IDS", "")
+def allowed_chat_ids() -> set[int] | None:
+    raw = os.getenv("ALLOWED_CHAT_IDS", "").strip()
+    if raw == "*":
+        return None
     return {int(value.strip()) for value in raw.split(",") if value.strip()}
 
 
@@ -115,7 +117,8 @@ async def telegram_webhook(request: Request) -> dict[str, bool]:
         raise HTTPException(status_code=404)
 
     message = extract_business_message(await request.json())
-    if message is None or message.chat_id not in allowed_chat_ids():
+    allowed = allowed_chat_ids()
+    if message is None or (allowed is not None and message.chat_id not in allowed):
         return {"ok": True}
 
     await send_business_message(message, build_reply(message))
