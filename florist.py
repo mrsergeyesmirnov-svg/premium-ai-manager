@@ -27,6 +27,7 @@ CATALOG = [
     {"name": "Пионовое облако", "price": 9900, "stock": 0, "flowers": "15 пионов", "tags": "пион", "style": "розовый, нежный"},
 ]
 NOTICE = "Это демо вымышленного магазина: цены и наличие учебные, заказы и оплата не оформляются."
+EXTRAS = {"ваза": 1500, "конфеты": 900}
 
 
 @dataclass
@@ -39,6 +40,9 @@ class Session:
     choices: list = field(default_factory=list)
     selected: dict | None = None
     delivery: str = ""
+    lush: bool = False
+    extras: set = field(default_factory=set)
+    extras_offered: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     replies: dict = field(default_factory=dict)
 
@@ -64,6 +68,8 @@ def get_session(connection: str, chat: int) -> Session:
 
 
 def update_preferences(s: Session, text: str):
+    if any(word in text for word in ("пышн", "объемн", "большой букет")):
+        s.lush = True
     for stem in ("роз", "пион", "лили", "эустом", "гортензи", "хризантем", "антуриум", "эвкалипт"):
         if re.search(r"(?:без|не любит|не хочу|не надо|кроме|исключи|аллерги)[^.!?\n]{0,45}\b" + stem, text):
             s.excluded.add(stem)
@@ -80,9 +86,22 @@ def update_preferences(s: Session, text: str):
 
 
 def available(s: Session):
-    return [b for b in CATALOG if b["stock"] > 0
+    options = [b for b in CATALOG if b["stock"] > 0
             and (s.budget is None or b["price"] <= s.budget)
             and not any(stem in b["tags"] for stem in s.excluded)]
+    if s.lush:
+        options.sort(key=lambda b: ("пышный" in b["style"], "объёмный" in b["style"]), reverse=True)
+    return options
+
+
+def order_summary(s: Session) -> str:
+    b = s.selected
+    fee = 700 if s.delivery == "доставка" and b["price"] < 10000 else 0
+    additions = "".join(f"\n{item.capitalize()}: {EXTRAS[item]} ₽" for item in sorted(s.extras))
+    total = b["price"] + fee + sum(EXTRAS[item] for item in s.extras)
+    return (f"Предварительный расчёт\n\n«{b['name']}» — {b['price']} ₽\nСостав: {b['flowers']}\n"
+            f"Получение: {s.delivery}, {fee} ₽{additions}\nИтого: {total} ₽\n"
+            "Упаковка и открытка включены.\n\nЭто демонстрационный расчёт, заказ не создан.")
 
 
 def scripted_reply(s: Session, text: str) -> str:
@@ -115,15 +134,34 @@ def scripted_reply(s: Session, text: str) -> str:
         s.selected = None
     if s.selected:
         b = s.selected
+        if any(word in text for word in ("добав", "замен", "увелич", "убер", "убрат", "пышнее")) and any(word in text for word in ("гортенз", "роз", "эустом", "цвет", "состав", "букет", "пышнее")):
+            return (f"Изменение состава «{b['name']}» нужно согласовать с флористом. "
+                    "В каталоге демо нет поштучных цен и остатков стеблей, поэтому точную доплату сейчас назвать не могу. "
+                    "Текущий расчёт оставлю без изменений. Рассмотреть более объёмный готовый букет?")
+        if any(word in text for word in ("более объем", "другой букет", "другие букет")):
+            s.selected = None
+            s.lush = True
+            return scripted_reply(s, "предложите варианты")
+        declined = bool(re.search(r"\b(?:нет|без|не надо|не нужно|уберите|убрать)\b", text))
+        mentioned = {name for name, stem in (("ваза", "ваз"), ("конфеты", "конфет")) if stem in text}
+        if mentioned and declined:
+            s.extras.difference_update(mentioned)
+        elif mentioned and any(word in text for word in ("добав", "беру", "давайте", "нужна", "нужны", "с ваз", "с конфет")):
+            s.extras.update(mentioned)
+        elif mentioned:
+            return "Ваза — 1 500 ₽, конфеты — 900 ₽. Упаковка и открытка уже включены. Добавить что-нибудь к букету?"
+        if declined and s.extras_offered and not mentioned:
+            s.extras.clear()
         if not s.delivery:
-            return f"«{b['name']}» — {b['flowers']}, {b['price']:,} ₽. Упаковка и открытка включены.\n\nДоставка или заберёте сами?".replace(",", " ")
-        fee = 700 if s.delivery == "доставка" and b["price"] < 10000 else 0
-        return (f"Учебная заявка\n\n«{b['name']}» — {b['price']} ₽\nСостав: {b['flowers']}\n"
-                f"Получение: {s.delivery}, {fee} ₽\nИтого: {b['price'] + fee} ₽\nОткрытка и упаковка включены.\n\n"
-                "В рабочем запуске здесь согласуем дату, время и детали с флористом. Сейчас заказ не создан, деньги и настоящие контакты не нужны. Для нового подбора напишите «заново».")
+            return f"«{b['name']}» — {b['price']} ₽.\nСостав: {b['flowers']}. Упаковка и открытка включены.\n\nВам удобнее доставка или самовывоз?"
+        summary = order_summary(s)
+        if not s.extras_offered:
+            s.extras_offered = True
+            summary += "\n\nК букету можно подобрать вазу за 1 500 ₽ или добавить конфеты за 900 ₽. Хотели бы дополнить подарок?"
+        return summary
     if s.budget is None:
         if not s.recipient:
-            return "Здравствуйте! Вы в «Тихом саду». Помогу выбрать букет без лишней суеты. Для кого он и на какую сумму ориентируемся? Можно сразу написать, какие цветы не подходят."
+            return "Здравствуйте. Ателье цветов «Тихий сад». Помогу подобрать букет с учётом повода и ваших пожеланий. Для кого выбираете подарок?"
         return f"Подберём букет для {s.recipient}. На какую сумму ориентируемся? Можно указать верхнюю границу — я её учту."
     options = available(s)
     if not options:
@@ -132,7 +170,7 @@ def scripted_reply(s: Session, text: str) -> str:
     if offset:
         options = options[1:] + options[:1]
     s.choices = options[:3]
-    rows = [f"{i}. «{b['name']}» — {b['price']} ₽\n{b['flowers']}. Характер: {b['style']}." for i, b in enumerate(s.choices, 1)]
+    rows = [f"{i}. «{b['name']}» — {b['price']} ₽\n{b['flowers']}. {b['style'].capitalize()}." for i, b in enumerate(s.choices, 1)]
     return "В вашем бюджете могу предложить:\n\n" + "\n\n".join(rows) + "\n\nКакой вариант ближе? Можно написать название или номер."
 
 
@@ -143,6 +181,9 @@ def ai_enabled():
 async def ai_reply(s: Session, text: str) -> str:
     prompt = """Ты виртуальный флорист демонстрационного ателье «Тихий сад».
 Общайся по-русски тепло, тактично и коротко, как внимательный консультант премиального магазина.
+Обращайся на «вы», без эмодзи, восклицаний, фамильярности, уменьшительных слов и рекламных штампов.
+Пиши 2–4 коротких предложения, кроме списка вариантов и расчёта. Не называй стиль «премиальным» в ответах.
+При запросе пышного букета предлагай сначала объёмные композиции, а не самые дешёвые.
 Не представляйся человеком, не выдумывай имя, опыт, действия или личные впечатления.
 При прямом вопросе честно скажи, что ты виртуальный помощник. Не повторяй приветствие.
 Учитывай весь диалог: получателя, повод, бюджет, стиль, исключённые цветы. Не задавай уже отвеченные вопросы.
@@ -151,6 +192,10 @@ async def ai_reply(s: Session, text: str) -> str:
 Запреты клиента важнее стиля; если вариантов нет, честно скажи. Не обещай замены, скидки или точную доставку.
 Не трактуй «не любит розы» как разрешение на розы. Не романтизируй подарки учителю и коллеге.
 Не дави допродажами. Сначала помоги выбрать, потом уточни доставку/самовывоз и желаемое время.
+После выбора предложи один раз уместное дополнение: вазу 1500 ₽ или конфеты 900 ₽.
+Объясни пользу кратко. Добавляй к расчёту только после явного согласия. После отказа не предлагай снова.
+При просьбе изменить состав отвечай по существу: поштучных цен и остатков нет,
+нужна проверка флористом. Не подтверждай наличие дополнительных стеблей и не выдумывай доплату.
 Заказов, оплаты, брони и подключения сотрудника в этом демо нет. Не говори «оформлено», «передал», «отправил».
 Вместо этого дай учебное резюме с точной суммой. Не запрашивай реальные телефоны, адреса и платёжные данные.
 При просьбе менеджера объясни, что в рабочей версии будет передача сотруднику, в демо она не подключена.
@@ -185,6 +230,9 @@ async def respond(s: Session, text: str) -> str:
         s.recipient = s.delivery = ""
         s.choices.clear()
         s.selected = None
+        s.lush = False
+        s.extras.clear()
+        s.extras_offered = False
         normalized = "привет"
     first = not s.history
     update_preferences(s, normalized)

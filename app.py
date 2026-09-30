@@ -1,6 +1,8 @@
 import os
 import hmac
 import re
+import asyncio
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
@@ -106,7 +108,7 @@ async def send_business_message(message: BusinessMessage, text: str) -> None:
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "webhook_ready": getattr(app.state, "webhook_ready", False),
-            "demo": "florist-v1", "dialogue_mode": "yandex" if ai_enabled() else "scripted"}
+            "demo": "florist-v2", "dialogue_mode": "yandex" if ai_enabled() else "scripted"}
 
 
 @app.post("/telegram/webhook")
@@ -128,9 +130,13 @@ async def telegram_webhook(request: Request) -> dict[str, bool]:
         cached = session.replies.get(message_id) if message_id is not None else None
         if cached and cached[1]:
             return {"ok": True}
+        started = time.monotonic()
         reply = cached[0] if cached else await respond(session, message.text)
         if message_id is not None:
             session.replies[message_id] = (reply, False)
+        # A measured pace; model latency counts toward the minimum delay.
+        if not cached:
+            await asyncio.sleep(max(0, min(6, 3 + len(reply) / 400) - (time.monotonic() - started)))
         await send_business_message(message, reply)
         if message_id is not None:
             session.replies[message_id] = (reply, True)
