@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
+from florist import ai_enabled, get_session, respond
 
 
 async def telegram_api(method: str, payload: dict):
@@ -64,8 +65,14 @@ def extract_business_message(update: dict) -> BusinessMessage | None:
     if not isinstance(update, dict):
         return None
     message = update.get("business_message")
-    if not isinstance(message, dict) or not isinstance(message.get("text"), str):
+    if not isinstance(message, dict):
         return None
+    text = message.get("text")
+    if not isinstance(text, str):
+        if message.get("photo") or message.get("voice") or message.get("document"):
+            text = "__unsupported_media__"
+        else:
+            return None
 
     connection_id = message.get("business_connection_id")
     chat_id = message.get("chat", {}).get("id")
@@ -77,7 +84,7 @@ def extract_business_message(update: dict) -> BusinessMessage | None:
             or message.get("via_business_bot")):
         return None
 
-    return BusinessMessage(chat_id, message["text"].strip(), connection_id)
+    return BusinessMessage(chat_id, text.strip(), connection_id)
 
 
 def allowed_chat_ids() -> set[int] | None:
@@ -85,14 +92,6 @@ def allowed_chat_ids() -> set[int] | None:
     if raw == "*":
         return None
     return {int(value.strip()) for value in raw.split(",") if value.strip()}
-
-
-def build_reply(message: BusinessMessage) -> str:
-    # ponytail: fixed reply until the approved Russian LLM and prompt are selected.
-    return (
-        "Спасибо за сообщение. Тестовый AI-менеджер получил ваш запрос: "
-        f"«{message.text[:300]}»"
-    )
 
 
 async def send_business_message(message: BusinessMessage, text: str) -> None:
@@ -106,7 +105,8 @@ async def send_business_message(message: BusinessMessage, text: str) -> None:
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "webhook_ready": getattr(app.state, "webhook_ready", False)}
+    return {"status": "ok", "webhook_ready": getattr(app.state, "webhook_ready", False),
+            "demo": "florist-v1", "dialogue_mode": "yandex" if ai_enabled() else "scripted"}
 
 
 @app.post("/telegram/webhook")
@@ -116,10 +116,24 @@ async def telegram_webhook(request: Request) -> dict[str, bool]:
     if not expected or not hmac.compare_digest(supplied.encode(), expected.encode()):
         raise HTTPException(status_code=404)
 
-    message = extract_business_message(await request.json())
+    update = await request.json()
+    message = extract_business_message(update)
     allowed = allowed_chat_ids()
     if message is None or (allowed is not None and message.chat_id not in allowed):
         return {"ok": True}
 
-    await send_business_message(message, build_reply(message))
+    session = get_session(message.business_connection_id, message.chat_id)
+    async with session.lock:
+        message_id = update["business_message"].get("message_id")
+        cached = session.replies.get(message_id) if message_id is not None else None
+        if cached and cached[1]:
+            return {"ok": True}
+        reply = cached[0] if cached else await respond(session, message.text)
+        if message_id is not None:
+            session.replies[message_id] = (reply, False)
+        await send_business_message(message, reply)
+        if message_id is not None:
+            session.replies[message_id] = (reply, True)
+            if len(session.replies) > 50:
+                del session.replies[next(iter(session.replies))]
     return {"ok": True}
