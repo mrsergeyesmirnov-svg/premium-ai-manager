@@ -11,10 +11,10 @@ from fastapi import FastAPI, HTTPException, Request
 from florist import ai_enabled, get_session, respond
 
 
-async def telegram_api(method: str, payload: dict):
+async def telegram_api(method: str, payload: dict, timeout: float = 15):
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(
                 f"https://api.telegram.org/bot{token}/{method}", json=payload
             )
@@ -119,6 +119,10 @@ async def telegram_webhook(request: Request) -> dict[str, bool]:
         raise HTTPException(status_code=404)
 
     update = await request.json()
+    return await process_update(update)
+
+
+async def process_update(update: dict) -> dict[str, bool]:
     message = extract_business_message(update)
     allowed = allowed_chat_ids()
     if message is None or (allowed is not None and message.chat_id not in allowed):

@@ -1,5 +1,46 @@
 # premium-ai-manager
 
+## Selectel / VDS: запуск без домена
+
+1. На Railway отключите GitHub Autodeploys в Source и удалите активный deployment через Remove.
+   Переменные сохраните у себя; весь проект и чужие сервисы не удаляйте.
+2. На сервере обновите код и соберите образ:
+
+```bash
+cd /opt/premium-ai-manager
+git pull --ff-only
+docker build -t premium-ai-manager .
+python3 setup_env.py
+```
+
+Настройщик запрашивает токен Telegram и ключ Яндекса скрытым вводом.
+Для Яндекса также нужен URI выбранной модели, например `gpt://FOLDER_ID/yandexgpt/latest`.
+`FOLDER_ID` замените ID каталога Yandex Cloud. Enter вместо ключа оставляет сценарный режим.
+Секреты сохраняются в `/etc/premium-ai-manager.env` с правами 600, вне Git и Docker-образа.
+Если меняете настройки повторно, введите оба секрета заново; после этого пересоздайте контейнер.
+
+```bash
+docker run -d --name premium-ai-manager --restart unless-stopped \
+  --env-file /etc/premium-ai-manager.env \
+  --mount type=volume,source=premium-ai-manager-data,target=/data \
+  --log-opt max-size=10m --log-opt max-file=3 \
+  premium-ai-manager python -u poll.py
+docker logs --tail 30 premium-ai-manager
+```
+
+При повторном запуске сначала `docker stop premium-ai-manager`, затем `docker rm premium-ai-manager`.
+Не запускайте одновременно Railway и polling или две копии polling с одним токеном.
+Polling автоматически проверяет токен через getMe и удаляет webhook без удаления ожидающих обновлений.
+Строка `Polling started` подтверждает запуск Telegram; работоспособность Yandex API проверяется первым диалогом.
+Порты на сервере публиковать не нужно. HTTP `/health` в polling-режиме не запускается.
+Для webhook-интеграции amoCRM позже потребуется отдельный публичный обработчик.
+
+Позиция очереди Telegram сохраняется в Docker volume. История диалога всё ещё в RAM.
+Демо обрабатывает очередь последовательно: долгий ответ задерживает следующие чаты.
+При постоянной ошибке отправки обработка повторяется; проверяйте логи.
+Дедупликация не обеспечивает exactly-once при падении между отправкой и сохранением позиции.
+До работы с реальными лидами нужны постоянное хранение диалогов и надёжная очередь.
+
 Безопасный тестовый контур автономного AI-менеджера для Telegram Business.
 
 ## Сейчас готово
