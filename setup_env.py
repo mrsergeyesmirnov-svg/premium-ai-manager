@@ -17,13 +17,17 @@ def main():
     token = getpass.getpass("Telegram bot token (hidden): ").strip()
     if not re.fullmatch(r"\d+:[A-Za-z0-9_-]+", token):
         raise SystemExit("Invalid Telegram token format. Nothing saved.")
+    admin_id = input("Your numeric Telegram ID for sales alerts: ").strip()
+    if not re.fullmatch(r"-?\d+", admin_id):
+        raise SystemExit("Invalid Telegram ID. Nothing saved.")
     api_key = getpass.getpass("Yandex API key (hidden; Enter = scripted demo): ").strip()
     model = ""
     if api_key:
         model = input("Yandex model URI (gpt://...): ").strip()
         if not re.fullmatch(r"gpt://[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?", model):
             raise SystemExit("Invalid model URI. Nothing saved.")
-    values = {"TELEGRAM_BOT_TOKEN": token, "ALLOWED_CHAT_IDS": "*",
+    values = {"TELEGRAM_BOT_TOKEN": token, "ADMIN_CHAT_ID": admin_id,
+              "ALLOWED_CHAT_IDS": "*", "SALES_DB_PATH": "/data/sales.db",
               "YANDEX_API_KEY": api_key, "YANDEX_MODEL_URI": model}
     if any(any(c.isspace() or ord(c) < 32 for c in value) for value in values.values()):
         raise SystemExit("Unexpected whitespace in a setting. Nothing saved.")

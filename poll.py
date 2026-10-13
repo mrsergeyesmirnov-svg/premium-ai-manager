@@ -4,8 +4,8 @@ import logging
 import os
 from pathlib import Path
 
-from app import allowed_chat_ids, process_update, telegram_api
-from florist import ai_enabled
+from app import admin_chat_id, allowed_chat_ids, process_update, telegram_api
+from sales import ai_enabled
 
 log = logging.getLogger("poll")
 
@@ -13,7 +13,7 @@ log = logging.getLogger("poll")
 async def receive_batch(offset: int, state_file: Path) -> int:
     updates = await telegram_api("getUpdates", {
         "offset": offset, "timeout": 25, "limit": 10,
-        "allowed_updates": ["business_connection", "business_message"],
+        "allowed_updates": ["business_connection", "business_message", "message"],
     }, timeout=40)
     for update in updates:
         await process_update(update)
@@ -31,6 +31,8 @@ async def main():
         raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
     if bool(os.getenv("YANDEX_API_KEY")) != bool(os.getenv("YANDEX_MODEL_URI")):
         raise RuntimeError("Set both YANDEX_API_KEY and YANDEX_MODEL_URI, or neither")
+    if admin_chat_id() is None:
+        raise RuntimeError("ADMIN_CHAT_ID is missing")
     allowed_chat_ids()
     state_file = Path(os.getenv("POLL_STATE_FILE", "/data/telegram-offset"))
     state_file.parent.mkdir(parents=True, exist_ok=True)

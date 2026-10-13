@@ -1,35 +1,56 @@
-import os
-import hmac
-import re
 import asyncio
+import hmac
+import os
+import re
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from functools import lru_cache
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from florist import ai_enabled, get_session, respond
+
+from sales import (Lead, LeadStore, RANK, ai_enabled, classify, contact_link,
+                   declined, discover_florists, draft_for, needs_handoff, sales_reply, state_for)
 
 
 async def telegram_api(method: str, payload: dict, timeout: float = 15):
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
-                f"https://api.telegram.org/bot{token}/{method}", json=payload
-            )
+            response = await client.post(f"https://api.telegram.org/bot{token}/{method}", json=payload)
             response.raise_for_status()
             data = response.json()
             if data.get("ok") is True:
                 return data.get("result")
     except (httpx.HTTPError, ValueError):
         pass
-    # Do not expose Telegram URLs, which contain the bot token.
     raise RuntimeError(f"Telegram {method} failed") from None
+
+
+@lru_cache
+def get_store() -> LeadStore:
+    return LeadStore(os.getenv("SALES_DB_PATH", "/data/sales.db"))
+
+
+def admin_chat_id() -> int | None:
+    value = os.getenv("ADMIN_CHAT_ID", "").strip()
+    return int(value) if value and value.lstrip("-").isdigit() else None
+
+
+async def notify_admin(text: str) -> None:
+    chat_id = admin_chat_id()
+    if chat_id is None:
+        return
+    try:
+        await telegram_api("sendMessage", {"chat_id": chat_id, "text": text[:4000]})
+    except RuntimeError:
+        pass
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    get_store()
     domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
     base_url = os.getenv("PUBLIC_BASE_URL", "") or (f"https://{domain}" if domain else "")
     app.state.webhook_ready = False
@@ -39,12 +60,10 @@ async def lifespan(app: FastAPI):
             raise RuntimeError("PUBLIC_BASE_URL must use HTTPS")
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", secret):
             raise RuntimeError("Set TELEGRAM_WEBHOOK_SECRET using letters, digits, _ or -")
-        allowed_chat_ids()  # Validate before accepting any messages.
         url = base_url.rstrip("/") + "/telegram/webhook"
         await telegram_api("setWebhook", {
-            "url": url,
-            "secret_token": secret,
-            "allowed_updates": ["business_connection", "business_message"],
+            "url": url, "secret_token": secret,
+            "allowed_updates": ["business_connection", "business_message", "message"],
         })
         info = await telegram_api("getWebhookInfo", {})
         if info.get("url") != url:
@@ -53,14 +72,17 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Premium AI Manager", lifespan=lifespan)
+app = FastAPI(title="Premium AI Sales Manager", lifespan=lifespan)
 
 
 @dataclass(frozen=True)
 class BusinessMessage:
     chat_id: int
+    username: str
+    display_name: str
     text: str
     business_connection_id: str
+    message_id: int | None
 
 
 def extract_business_message(update: dict) -> BusinessMessage | None:
@@ -72,43 +94,127 @@ def extract_business_message(update: dict) -> BusinessMessage | None:
     text = message.get("text")
     if not isinstance(text, str):
         if message.get("photo") or message.get("voice") or message.get("document"):
-            text = "__unsupported_media__"
+            text = "[клиент отправил вложение]"
         else:
             return None
-
     connection_id = message.get("business_connection_id")
-    chat_id = message.get("chat", {}).get("id")
-    if not connection_id or not isinstance(chat_id, int):
-        return None
+    chat = message.get("chat", {})
     sender = message.get("from", {})
-    if (message.get("chat", {}).get("type") != "private"
-            or sender.get("id") != chat_id or sender.get("is_bot")
-            or message.get("via_business_bot")):
+    chat_id = chat.get("id")
+    if (not connection_id or not isinstance(chat_id, int) or chat.get("type") != "private"
+            or sender.get("id") != chat_id or sender.get("is_bot") or message.get("via_business_bot")):
         return None
-
-    return BusinessMessage(chat_id, text.strip(), connection_id)
+    display_name = " ".join(filter(None, (sender.get("first_name"), sender.get("last_name"))))
+    return BusinessMessage(chat_id, sender.get("username", ""), display_name, text.strip(),
+                           connection_id, message.get("message_id"))
 
 
 def allowed_chat_ids() -> set[int] | None:
-    raw = os.getenv("ALLOWED_CHAT_IDS", "").strip()
+    raw = os.getenv("ALLOWED_CHAT_IDS", "*").strip()
     if raw == "*":
         return None
     return {int(value.strip()) for value in raw.split(",") if value.strip()}
 
 
 async def send_business_message(message: BusinessMessage, text: str) -> None:
-    payload = {
+    await telegram_api("sendMessage", {
         "business_connection_id": message.business_connection_id,
         "chat_id": message.chat_id,
         "text": text,
-    }
+    })
+
+
+def lead_line(lead: Lead) -> str:
+    handle = f"@{lead.username}" if lead.username else lead.contact or "контакт не указан"
+    paused = " · ручной режим" if lead.paused else ""
+    return f"#{lead.id} · {lead.status.upper()}{paused}\n{lead.name} · {handle} · {lead.city or 'город не указан'}"
+
+
+def parse_id(text: str) -> int | None:
+    match = re.search(r"\s(\d+)\s*$", text)
+    return int(match.group(1)) if match else None
+
+
+HELP = """Продажи цветочным магазинам
+
+/add Название | @username | город | заметка
+/find спб — найти магазины с публичными контактами
+/leads [cold|warm|hot] — последние лиды
+/draft ID — подготовить первое сообщение
+/sent ID — отметить ручную отправку
+/lead ID — карточка и последнее сообщение
+/pause ID — отключить автоответы
+/resume ID — вернуть автоответы
+
+Первое холодное сообщение бот не отправляет сам: /draft даёт текст и кнопку перехода в чат."""
+
+
+async def process_admin_message(update: dict) -> dict[str, bool]:
+    message = update.get("message")
+    if not isinstance(message, dict):
+        return {"ok": True}
+    sender_id = message.get("from", {}).get("id")
+    text = message.get("text", "").strip()
+    if sender_id != admin_chat_id() or message.get("chat", {}).get("type") != "private":
+        return {"ok": True}
+    store = get_store()
+    payload = {"chat_id": sender_id}
+    if text in ("/start", "/help"):
+        payload["text"] = HELP
+    elif text.startswith("/add "):
+        parts = [part.strip() for part in text[5:].split("|")]
+        if len(parts) < 2 or not parts[0]:
+            payload["text"] = "Формат: /add Название | @username | город | заметка"
+        else:
+            parts += [""] * (4 - len(parts))
+            lead = store.add(parts[0], parts[1], parts[2], parts[1], parts[3])
+            payload["text"] = "Добавлен:\n" + lead_line(lead) + f"\n\nСледом: /draft {lead.id}"
+    elif text.startswith("/find "):
+        try:
+            found = await discover_florists(text[6:].strip())
+            for item in found:
+                store.add(**item)
+            with_telegram = sum(bool(item["username"]) for item in found)
+            payload["text"] = (f"Добавлено или обновлено: {len(found)}. С Telegram: {with_telegram}.\n"
+                               "Это публичные контакты организаций, не подтверждённые владельцы.\n\n/leads cold")
+        except (ValueError, httpx.HTTPError, KeyError):
+            payload["text"] = "Не удалось получить открытые данные. Доступны команды: /find спб или /find москва"
+    elif text.startswith("/leads"):
+        status = text.partition(" ")[2].strip().lower()
+        leads = store.list(status)
+        payload["text"] = "\n\n".join(map(lead_line, leads)) if leads else "Лидов пока нет."
+    elif text.startswith("/draft "):
+        lead = store.get(parse_id(text) or 0)
+        if not lead:
+            payload["text"] = "Лид не найден."
+        else:
+            payload["text"] = draft_for(lead)
+            link = contact_link(lead)
+            if link:
+                payload["reply_markup"] = {"inline_keyboard": [[{"text": "Открыть чат и отправить вручную", "url": link}]]}
+            else:
+                payload["text"] += f"\n\nКонтакт: {lead.contact or 'не найден'}"
+    elif text.startswith("/sent "):
+        lead_id = parse_id(text) or 0
+        lead = store.set_state(lead_id, status="cold") if store.get(lead_id) else None
+        payload["text"] = "Отправка отмечена. Теперь ответы этого лида будет обрабатывать менеджер." if lead else "Лид не найден."
+    elif text.startswith("/pause ") or text.startswith("/resume "):
+        lead_id = parse_id(text) or 0
+        lead = store.set_state(lead_id, paused=text.startswith("/pause ")) if store.get(lead_id) else None
+        payload["text"] = ("Автоответы остановлены." if lead and lead.paused else "Автоответы включены.") if lead else "Лид не найден."
+    elif text.startswith("/lead "):
+        lead = store.get(parse_id(text) or 0)
+        payload["text"] = (lead_line(lead) + f"\n\nЗаметка: {lead.note or '—'}\nПоследнее: {lead.last_message or '—'}") if lead else "Лид не найден."
+    else:
+        payload["text"] = HELP
     await telegram_api("sendMessage", payload)
+    return {"ok": True}
 
 
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "webhook_ready": getattr(app.state, "webhook_ready", False),
-            "demo": "florist-v2", "dialogue_mode": "yandex" if ai_enabled() else "scripted"}
+            "mode": "sales", "dialogue_mode": "yandex" if ai_enabled() else "scripted"}
 
 
 @app.post("/telegram/webhook")
@@ -117,33 +223,55 @@ async def telegram_webhook(request: Request) -> dict[str, bool]:
     supplied = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
     if not expected or not hmac.compare_digest(supplied.encode(), expected.encode()):
         raise HTTPException(status_code=404)
-
-    update = await request.json()
-    return await process_update(update)
+    return await process_update(await request.json())
 
 
 async def process_update(update: dict) -> dict[str, bool]:
+    if "message" in update and "business_message" not in update:
+        return await process_admin_message(update)
     message = extract_business_message(update)
     allowed = allowed_chat_ids()
     if message is None or (allowed is not None and message.chat_id not in allowed):
         return {"ok": True}
-
-    session = get_session(message.business_connection_id, message.chat_id)
-    async with session.lock:
-        message_id = update["business_message"].get("message_id")
-        cached = session.replies.get(message_id) if message_id is not None else None
+    store = get_store()
+    lead = store.match(message.chat_id, message.username, message.business_connection_id)
+    if lead is None:
+        await notify_admin(
+            f"Новый неизвестный контакт: {message.display_name or 'без имени'} "
+            f"@{message.username or 'без_username'}\nСообщение: {message.text[:1000]}\n\n"
+            "Автоответ не отправлен. Добавьте контакт через /add, если это лид."
+        )
+        return {"ok": True}
+    state = state_for(message.chat_id)
+    async with state.lock:
+        cached = state.replies.get(message.message_id) if message.message_id is not None else None
         if cached and cached[1]:
             return {"ok": True}
-        started = time.monotonic()
-        reply = cached[0] if cached else await respond(session, message.text)
-        if message_id is not None:
-            session.replies[message_id] = (reply, False)
-        # A measured pace; model latency counts toward the minimum delay.
         if not cached:
-            await asyncio.sleep(max(0, min(6, 3 + len(reply) / 400) - (time.monotonic() - started)))
+            store.record(lead.id, "in", message.text)
+            incoming_status = classify(message.text)
+            status = incoming_status if RANK[incoming_status] > RANK[lead.status] else lead.status
+            handoff = needs_handoff(message.text)
+            stop = declined(message.text)
+            lead = store.set_state(lead.id, status=status, paused=lead.paused or handoff or stop)
+            if lead.paused and not (handoff or stop):
+                await notify_admin(f"Сообщение в ручном режиме\n{lead_line(lead)}\n\n{message.text[:1500]}")
+                return {"ok": True}
+            started = time.monotonic()
+            reply = await sales_reply(lead, store.history(lead.id)[:-1], message.text)
+            store.record(lead.id, "out", reply)
+            if message.message_id is not None:
+                state.replies[message.message_id] = (reply, False)
+            await asyncio.sleep(max(0, min(8, 4 + len(reply) / 350) - (time.monotonic() - started)))
+        else:
+            reply = cached[0]
         await send_business_message(message, reply)
-        if message_id is not None:
-            session.replies[message_id] = (reply, True)
-            if len(session.replies) > 50:
-                del session.replies[next(iter(session.replies))]
+        if message.message_id is not None:
+            state.replies[message.message_id] = (reply, True)
+            if len(state.replies) > 50:
+                del state.replies[next(iter(state.replies))]
+        if lead.status in ("warm", "hot"):
+            marker = "🔥 ГОРЯЧИЙ" if lead.status == "hot" else "🟡 ТЁПЛЫЙ"
+            action = f"\nАвтоответы остановлены. /resume {lead.id}" if lead.paused else ""
+            await notify_admin(f"{marker}\n{lead_line(lead)}\n\n{message.text[:1500]}{action}")
     return {"ok": True}
