@@ -11,7 +11,8 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 
 from sales import (Lead, LeadStore, RANK, ai_enabled, classify, contact_link,
-                   declined, discover_florists, draft_for, needs_handoff, sales_reply, state_for)
+                   declined, discover_florists, draft_for, needs_handoff, phone_number,
+                   sales_reply, state_for, website_link)
 
 
 async def telegram_api(method: str, payload: dict, timeout: float = 15):
@@ -125,7 +126,7 @@ async def send_business_message(message: BusinessMessage, text: str) -> None:
 
 
 def lead_line(lead: Lead) -> str:
-    handle = f"@{lead.username}" if lead.username else lead.contact or "контакт не указан"
+    handle = f"@{lead.username}" if lead.username else phone_number(lead) or "без Telegram"
     paused = " · ручной режим" if lead.paused else ""
     return f"#{lead.id} · {lead.status.upper()}{paused}\n{lead.name} · {handle} · {lead.city or 'город не указан'}"
 
@@ -191,10 +192,17 @@ async def process_admin_message(update: dict) -> dict[str, bool]:
         if not lead:
             payload["text"] = "Лид не найден."
         else:
-            payload["text"] = draft_for(lead)
-            link = contact_link(lead)
-            if link:
-                payload["reply_markup"] = {"inline_keyboard": [[{"text": "Открыть чат и отправить вручную", "url": link}]]}
+            payload["text"] = (f"{lead_line(lead)}\n\nТекст первого сообщения:\n\n{draft_for(lead)}"
+                               f"\n\nПосле отправки нажмите /sent {lead.id}")
+            buttons = []
+            telegram = contact_link(lead)
+            website = website_link(lead)
+            if telegram:
+                buttons.append({"text": "Написать в Telegram", "url": telegram})
+            if website:
+                buttons.append({"text": "Открыть сайт", "url": website})
+            if buttons:
+                payload["reply_markup"] = {"inline_keyboard": [buttons]}
             else:
                 payload["text"] += f"\n\nКонтакт: {lead.contact or 'не найден'}"
     elif text.startswith("/sent "):
