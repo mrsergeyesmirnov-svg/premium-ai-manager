@@ -27,7 +27,9 @@ class SalesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             lead = LeadStore(directory + "/sales.db").add("RomRom", "@RomRomShop", "СПб")
             self.assertEqual(normalize_username("https://t.me/RomRomShop"), "romromshop")
-            self.assertIn("короткий пример", draft_for(lead))
+            self.assertIn("короткое живое демо", draft_for(lead))
+            self.assertIn("Меня зовут Сергей", draft_for(lead))
+            self.assertIn("mrsergeyesmirnov-svg.github.io", draft_for(lead))
             self.assertNotIn("amoCRM", draft_for(lead))
             self.assertTrue(contact_link(lead).startswith("https://t.me/romromshop?text="))
             self.assertEqual(classify("Можно узнать стоимость и созвониться?"), "hot")
