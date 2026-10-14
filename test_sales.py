@@ -1,7 +1,7 @@
 import tempfile
 import unittest
 
-from sales import (LeadStore, classify, clean_business_name, contact_link, draft_for,
+from sales import (LeadStore, classify, clean_business_name, contact_link, draft_for, lead_display_name,
                    normalize_username, parse_search_results, website_link, yandex_folder_id)
 
 
@@ -52,9 +52,11 @@ class SalesTest(unittest.TestCase):
         ), "Весна")
         with tempfile.TemporaryDirectory() as directory:
             lead = LeadStore(directory + "/sales.db").add(
-                "Весна", contact="+7 (904) 215-91-35 · https://vesnabuket.ru/adresa-magazinov/"
+                "Адреса магазинов - Весна - Доставка цветов в Санкт-Петербурге",
+                contact="+7 (904) 215-91-35 · https://vesnabuket.ru/adresa-magazinov/"
             )
             self.assertEqual(website_link(lead), "https://vesnabuket.ru/adresa-magazinov/")
+            self.assertEqual(lead_display_name(lead), "Весна")
 
     def test_infers_search_folder_from_model_uri(self):
         from unittest.mock import patch
