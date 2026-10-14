@@ -212,7 +212,7 @@ def declined(text: str) -> bool:
 
 def draft_for(lead: Lead) -> str:
     return (
-        f"Здравствуйте! Посмотрел «{lead.name}» — у вас очень приятная подача букетов. "
+        f"Здравствуйте! Посмотрел «{lead_display_name(lead)}» — у вас очень приятная подача букетов. "
         "Я Сергей, делаю для цветочных магазинов онлайн-менеджера в Telegram: он быстро отвечает клиенту, "
         "помогает выбрать букет из актуального ассортимента и передаёт сотруднику уже понятный заказ.\n\n"
         "Сейчас ищу несколько магазинов, которым могу лично показать рабочее демо и настроить его под реальные "
@@ -275,6 +275,11 @@ def clean_business_name(title: str, url: str) -> str:
     host = urlparse(url).netloc.lower().removeprefix("www.")
     stem = host.split(".")[0].replace("-", " ").strip()
     return stem.title()[:200] or "Цветочный магазин"
+
+
+def lead_display_name(lead: Lead) -> str:
+    """Also fixes leads saved before title cleanup was introduced."""
+    return clean_business_name(lead.name, website_link(lead))
 
 
 def parse_search_results(raw_xml: bytes, city: str) -> list[dict]:
