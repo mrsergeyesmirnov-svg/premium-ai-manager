@@ -211,18 +211,29 @@ def declined(text: str) -> bool:
 
 
 def draft_for(lead: Lead) -> str:
-    detail = f" в {lead.city}" if lead.city else ""
     return (
-        f"Здравствуйте! Обратил внимание на «{lead.name}»{detail}. "
-        "Я разрабатываю онлайн-менеджера для цветочных магазинов: он отвечает клиентам в Telegram, "
-        "подбирает букеты по ассортименту и передаёт заинтересованные заявки сотруднику или в amoCRM. "
-        "Сейчас проверяю решение на практике. Можно показать короткое демо? "
-        "Если неактуально — больше писать не буду."
+        f"Здравствуйте! Посмотрел «{lead.name}» — у вас очень приятная подача букетов. "
+        "Я Сергей, делаю для цветочных магазинов онлайн-менеджера в Telegram: он быстро отвечает клиенту, "
+        "помогает выбрать букет из актуального ассортимента и передаёт сотруднику уже понятный заказ.\n\n"
+        "Сейчас ищу несколько магазинов, которым могу лично показать рабочее демо и настроить его под реальные "
+        "диалоги с покупателями. Отправить вам короткий пример?"
     )
 
 
 def contact_link(lead: Lead) -> str:
     return f"https://t.me/{lead.username}?text={quote(draft_for(lead))}" if lead.username else ""
+
+
+def website_link(lead: Lead) -> str:
+    for value in re.findall(r"https?://[^\s·]+", lead.contact):
+        if "t.me/" not in value.lower():
+            return value.rstrip(".,)")
+    return ""
+
+
+def phone_number(lead: Lead) -> str:
+    match = re.search(r"(?:\+7|8)[\s(.-]*\d{3}[\s).-]*\d{3}[\s.-]*\d{2}[\s.-]*\d{2}", lead.contact)
+    return match.group(0).strip() if match else ""
 
 
 def yandex_folder_id() -> str:
@@ -235,6 +246,35 @@ def yandex_folder_id() -> str:
 
 def _text(node) -> str:
     return "".join(node.itertext()).strip() if node is not None else ""
+
+
+GENERIC_TITLE = re.compile(
+    r"\b(адрес(?:а|ы)?|магазин(?:ы|ов)?|доставк\w*|цвет(?:ы|ов|очный|очная|очные)?|букет\w*|"
+    r"заказ(?:ать)?|купить|каталог|контакт\w*|официальн\w*|сайт|санкт[- ]?петербург|спб|москва)\b",
+    re.I,
+)
+
+
+def clean_business_name(title: str, url: str) -> str:
+    """Pick the brand-like part instead of a generic SEO page heading."""
+    parts = [part.strip(" —–|-:«»\"'") for part in re.split(r"\s*(?:\||—|–| - )\s*", title)]
+    candidates = []
+    for index, part in enumerate(parts):
+        if not part or len(part) > 80:
+            continue
+        words = re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", part)
+        generic_count = len(GENERIC_TITLE.findall(part))
+        score = 8 - len(words) - generic_count * 5 - index * 0.1
+        if 1 <= len(words) <= 4 and generic_count == 0:
+            score += 10
+        candidates.append((score, part))
+    if candidates:
+        name = max(candidates, key=lambda item: item[0])[1]
+        if not GENERIC_TITLE.fullmatch(name):
+            return name[:200]
+    host = urlparse(url).netloc.lower().removeprefix("www.")
+    stem = host.split(".")[0].replace("-", " ").strip()
+    return stem.title()[:200] or "Цветочный магазин"
 
 
 def parse_search_results(raw_xml: bytes, city: str) -> list[dict]:
@@ -253,7 +293,7 @@ def parse_search_results(raw_xml: bytes, city: str) -> list[dict]:
         host = urlparse(url).netloc.lower().removeprefix("www.")
         own_site = bool(host and not any(host == item or host.endswith("." + item) for item in AGGREGATORS))
         score = 6 * bool(username) + 4 * own_site + 3 * bool(phone) + 1
-        name = re.split(r"\s+[|—–]\s+", title, maxsplit=1)[0][:200] or host
+        name = clean_business_name(title, url)
         contact = " · ".join(dict.fromkeys(value for value in (f"@{username}" if username else "", phone, url) if value))
         leads.append({"name": name, "username": username, "city": city, "contact": contact,
                       "note": f"Яндекс · качество {score}/14 · {snippet[:500]}", "score": score})
