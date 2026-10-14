@@ -11,7 +11,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 
 from sales import (Lead, LeadStore, RANK, ai_enabled, classify, contact_link,
-                   declined, discover_florists, draft_for, needs_handoff, phone_number,
+                   declined, discover_florists, draft_for, lead_display_name, needs_handoff, phone_number,
                    sales_reply, state_for, website_link)
 
 
@@ -128,7 +128,7 @@ async def send_business_message(message: BusinessMessage, text: str) -> None:
 def lead_line(lead: Lead) -> str:
     handle = f"@{lead.username}" if lead.username else phone_number(lead) or "без Telegram"
     paused = " · ручной режим" if lead.paused else ""
-    return f"#{lead.id} · {lead.status.upper()}{paused}\n{lead.name} · {handle} · {lead.city or 'город не указан'}"
+    return f"#{lead.id} · {lead.status.upper()}{paused}\n{lead_display_name(lead)} · {handle} · {lead.city or 'город не указан'}"
 
 
 def parse_id(text: str) -> int | None:
