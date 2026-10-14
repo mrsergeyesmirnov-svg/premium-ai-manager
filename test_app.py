@@ -51,7 +51,7 @@ class FlowTest(unittest.IsolatedAsyncioTestCase):
             await process_admin_message({"message": {"chat": {"id": 100, "type": "private"}, "from": {"id": 100},
                                                      "text": f"/draft {lead.id}"}})
             self.assertIn("inline_keyboard", api.call_args.args[1]["reply_markup"])
-            self.assertIn("короткое демо", api.call_args.args[1]["text"])
+            self.assertIn("короткий пример", api.call_args.args[1]["text"])
 
     async def test_known_lead_gets_reply_and_hot_alert(self):
         lead = self.store.add("RomRom", "romromshop", "СПб")
