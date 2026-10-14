@@ -1,7 +1,8 @@
 import tempfile
 import unittest
 
-from sales import LeadStore, classify, contact_link, draft_for, normalize_username
+from sales import (LeadStore, classify, contact_link, draft_for,
+                   normalize_username, parse_search_results, yandex_folder_id)
 
 
 class SalesTest(unittest.TestCase):
@@ -30,6 +31,23 @@ class SalesTest(unittest.TestCase):
             self.assertTrue(contact_link(lead).startswith("https://t.me/romromshop?text="))
             self.assertEqual(classify("Можно узнать стоимость и созвониться?"), "hot")
             self.assertEqual(classify("Покажите демо"), "warm")
+
+    def test_parses_and_scores_yandex_results(self):
+        raw = '''<?xml version="1.0" encoding="utf-8"?>
+        <yandexsearch><response><results><grouping><group><doc>
+        <url>https://t.me/romromflowers</url><title>RomRom — цветочный магазин</title>
+        <passages><passage>Букеты в Санкт-Петербурге +7 (999) 123-45-67</passage></passages>
+        </doc></group><group><doc><url>https://example.com/cars</url><title>Автомобили</title></doc></group>
+        </grouping></results></response></yandexsearch>'''.encode()
+        leads = parse_search_results(raw, "Санкт-Петербург")
+        self.assertEqual(len(leads), 1)
+        self.assertEqual(leads[0]["username"], "romromflowers")
+        self.assertIn("+7 (999) 123-45-67", leads[0]["contact"])
+
+    def test_infers_search_folder_from_model_uri(self):
+        from unittest.mock import patch
+        with patch.dict("os.environ", {"YANDEX_SEARCH_FOLDER_ID": "", "YANDEX_MODEL_URI": "gpt://folder-1/yandexgpt/latest"}):
+            self.assertEqual(yandex_folder_id(), "folder-1")
 
 
 if __name__ == "__main__":

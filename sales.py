@@ -1,26 +1,30 @@
 """Small persistent sales queue for a Telegram Business account."""
 from __future__ import annotations
 import asyncio
+import base64
 import json
 import logging
 import os
 import re
 import sqlite3
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 
 
 log = logging.getLogger("sales")
 RANK = {"cold": 0, "warm": 1, "hot": 2}
-CITY_BBOXES = {
-    "спб": (59.70, 29.40, 60.20, 30.80),
-    "санкт-петербург": (59.70, 29.40, 60.20, 30.80),
-    "москва": (55.48, 37.29, 55.96, 37.97),
+CITY_SEARCH = {
+    "спб": ("Санкт-Петербург", "2"),
+    "санкт-петербург": ("Санкт-Петербург", "2"),
+    "москва": ("Москва", "213"),
 }
+SEARCH_URL = "https://searchapi.api.cloud.yandex.net/v2/web/search"
+AGGREGATORS = {"yandex.ru", "2gis.ru", "zoon.ru", "yell.ru", "flamp.ru", "vk.com", "t.me"}
 
 
 def normalize_username(value: str) -> str:
@@ -221,34 +225,80 @@ def contact_link(lead: Lead) -> str:
     return f"https://t.me/{lead.username}?text={quote(draft_for(lead))}" if lead.username else ""
 
 
-async def discover_florists(city: str) -> list[dict]:
-    bbox = CITY_BBOXES.get(city.lower().strip())
-    if not bbox:
-        raise ValueError("Доступны: спб, санкт-петербург, москва")
-    south, west, north, east = bbox
-    query = f'''[out:json][timeout:25];(
-      nwr["shop"="florist"]({south},{west},{north},{east});
-    );out tags center 100;'''
-    async with httpx.AsyncClient(timeout=35, headers={"User-Agent": "premium-ai-manager/1.0"}, trust_env=False) as client:
-        response = await client.post("https://overpass-api.de/api/interpreter", content=query)
-        response.raise_for_status()
-        elements = response.json().get("elements", [])
-    found = []
-    for item in elements:
-        tags = item.get("tags", {})
-        name = tags.get("name")
-        if not name:
+def yandex_folder_id() -> str:
+    explicit = os.getenv("YANDEX_SEARCH_FOLDER_ID", "").strip()
+    if explicit:
+        return explicit
+    match = re.match(r"gpt://([^/]+)/", os.getenv("YANDEX_MODEL_URI", ""))
+    return match.group(1) if match else ""
+
+
+def _text(node) -> str:
+    return "".join(node.itertext()).strip() if node is not None else ""
+
+
+def parse_search_results(raw_xml: bytes, city: str) -> list[dict]:
+    root = ET.fromstring(raw_xml)
+    leads = []
+    for doc in root.findall(".//group/doc"):
+        url = _text(doc.find("url"))
+        title = re.sub(r"\s+", " ", _text(doc.find("title")))
+        snippet = " ".join(_text(node) for node in doc.findall(".//passage"))
+        evidence = f"{title} {snippet} {url}"
+        if not url or not re.search(r"цвет|букет|флорист", evidence, re.I):
             continue
-        raw_telegram = tags.get("contact:telegram") or tags.get("telegram") or ""
-        website = tags.get("contact:website") or tags.get("website") or ""
-        phone = tags.get("contact:phone") or tags.get("phone") or ""
-        email = tags.get("contact:email") or tags.get("email") or ""
-        username = normalize_username(raw_telegram)
-        contact = " · ".join(value for value in (raw_telegram, phone, email, website) if value)
-        if contact:
-            found.append({"name": name, "username": username, "city": city, "contact": contact,
-                          "note": "Открытые данные OpenStreetMap"})
-    return found[:100]
+        username = normalize_username(evidence)
+        phone_match = re.search(r"(?:\+7|8)[\s(.-]*\d{3}[\s).-]*\d{3}[\s.-]*\d{2}[\s.-]*\d{2}", evidence)
+        phone = phone_match.group(0).strip() if phone_match else ""
+        host = urlparse(url).netloc.lower().removeprefix("www.")
+        own_site = bool(host and not any(host == item or host.endswith("." + item) for item in AGGREGATORS))
+        score = 6 * bool(username) + 4 * own_site + 3 * bool(phone) + 1
+        name = re.split(r"\s+[|—–]\s+", title, maxsplit=1)[0][:200] or host
+        contact = " · ".join(dict.fromkeys(value for value in (f"@{username}" if username else "", phone, url) if value))
+        leads.append({"name": name, "username": username, "city": city, "contact": contact,
+                      "note": f"Яндекс · качество {score}/14 · {snippet[:500]}", "score": score})
+    return leads
+
+
+async def _yandex_search(query: str, city: str, region: str, api_key: str, folder_id: str) -> list[dict]:
+    payload = {
+        "query": {"searchType": "SEARCH_TYPE_RU", "queryText": query, "familyMode": "FAMILY_MODE_MODERATE"},
+        "groupSpec": {"groupMode": "GROUP_MODE_FLAT", "groupsOnPage": "30", "docsInGroup": "1"},
+        "maxPassages": "2", "region": region, "l10n": "LOCALIZATION_RU",
+        "folderId": folder_id, "responseFormat": "FORMAT_XML",
+    }
+    async with httpx.AsyncClient(timeout=35, trust_env=False) as client:
+        response = await client.post(SEARCH_URL, headers={"Authorization": "Api-Key " + api_key,
+                                                          "x-data-logging-enabled": "false"}, json=payload)
+        response.raise_for_status()
+        raw = base64.b64decode(response.json()["rawData"], validate=True)
+    return parse_search_results(raw, city)
+
+
+async def discover_florists(city: str) -> list[dict]:
+    place = CITY_SEARCH.get(city.lower().strip())
+    if not place:
+        raise ValueError("Доступны: спб, санкт-петербург, москва")
+    api_key, folder_id = os.getenv("YANDEX_API_KEY", "").strip(), yandex_folder_id()
+    if not api_key or not folder_id:
+        raise RuntimeError("Для поиска нужны YANDEX_API_KEY и YANDEX_SEARCH_FOLDER_ID")
+    city_name, region = place
+    queries = (
+        f'"цветочный магазин" {city_name} контакты',
+        f'"цветочная мастерская" {city_name} заказать букет',
+        f'site:t.me цветы магазин {city_name}',
+    )
+    batches = await asyncio.gather(*(_yandex_search(query, city_name, region, api_key, folder_id) for query in queries))
+    unique = {}
+    for lead in (item for batch in batches for item in batch):
+        lead["city"] = city_name
+        key = lead["username"] or urlparse(lead["contact"].split(" · ")[-1]).netloc + lead["name"].lower()
+        if key and (key not in unique or lead["score"] > unique[key]["score"]):
+            unique[key] = lead
+    result = sorted(unique.values(), key=lambda item: (-item["score"], item["name"].lower()))[:60]
+    for lead in result:
+        lead.pop("score")
+    return result
 
 
 def ai_enabled() -> bool:

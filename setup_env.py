@@ -26,9 +26,11 @@ def main():
         model = input("Yandex model URI (gpt://...): ").strip()
         if not re.fullmatch(r"gpt://[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?", model):
             raise SystemExit("Invalid model URI. Nothing saved.")
+    search_folder = model.split("/")[2] if model else ""
     values = {"TELEGRAM_BOT_TOKEN": token, "ADMIN_CHAT_ID": admin_id,
               "ALLOWED_CHAT_IDS": "*", "SALES_DB_PATH": "/data/sales.db",
-              "YANDEX_API_KEY": api_key, "YANDEX_MODEL_URI": model}
+              "YANDEX_API_KEY": api_key, "YANDEX_MODEL_URI": model,
+              "YANDEX_SEARCH_FOLDER_ID": search_folder}
     if any(any(c.isspace() or ord(c) < 32 for c in value) for value in values.values()):
         raise SystemExit("Unexpected whitespace in a setting. Nothing saved.")
     temporary = target.with_suffix(".tmp")

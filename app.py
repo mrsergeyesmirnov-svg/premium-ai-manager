@@ -138,7 +138,7 @@ def parse_id(text: str) -> int | None:
 HELP = """Продажи цветочным магазинам
 
 /add Название | @username | город | заметка
-/find спб — найти магазины с публичными контактами
+/find спб — найти лидов через поиск Яндекса
 /leads [cold|warm|hot] — последние лиды
 /draft ID — подготовить первое сообщение
 /sent ID — отметить ручную отправку
@@ -175,10 +175,13 @@ async def process_admin_message(update: dict) -> dict[str, bool]:
             for item in found:
                 store.add(**item)
             with_telegram = sum(bool(item["username"]) for item in found)
-            payload["text"] = (f"Добавлено или обновлено: {len(found)}. С Telegram: {with_telegram}.\n"
-                               "Это публичные контакты организаций, не подтверждённые владельцы.\n\n/leads cold")
-        except (ValueError, httpx.HTTPError, KeyError):
-            payload["text"] = "Не удалось получить открытые данные. Доступны команды: /find спб или /find москва"
+            payload["text"] = (f"Яндекс: добавлено или обновлено {len(found)} лидов. С Telegram: {with_telegram}.\n"
+                               "Выше стоят лиды с прямыми контактами. Это контакты организаций, а не подтверждённые владельцы.\n\n/leads cold")
+        except RuntimeError as error:
+            payload["text"] = str(error)
+        except (ValueError, httpx.HTTPError, KeyError, SyntaxError):
+            payload["text"] = ("Поиск Яндекса недоступен. Проверьте роль search-api.webSearch.user, "
+                               "платёжный аккаунт и YANDEX_SEARCH_FOLDER_ID.")
     elif text.startswith("/leads"):
         status = text.partition(" ")[2].strip().lower()
         leads = store.list(status)
