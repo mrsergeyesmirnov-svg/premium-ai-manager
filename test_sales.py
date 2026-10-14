@@ -1,8 +1,8 @@
 import tempfile
 import unittest
 
-from sales import (LeadStore, classify, contact_link, draft_for,
-                   normalize_username, parse_search_results, yandex_folder_id)
+from sales import (LeadStore, classify, clean_business_name, contact_link, draft_for,
+                   normalize_username, parse_search_results, website_link, yandex_folder_id)
 
 
 class SalesTest(unittest.TestCase):
@@ -27,7 +27,8 @@ class SalesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             lead = LeadStore(directory + "/sales.db").add("RomRom", "@RomRomShop", "СПб")
             self.assertEqual(normalize_username("https://t.me/RomRomShop"), "romromshop")
-            self.assertIn("короткое демо", draft_for(lead))
+            self.assertIn("короткий пример", draft_for(lead))
+            self.assertNotIn("amoCRM", draft_for(lead))
             self.assertTrue(contact_link(lead).startswith("https://t.me/romromshop?text="))
             self.assertEqual(classify("Можно узнать стоимость и созвониться?"), "hot")
             self.assertEqual(classify("Покажите демо"), "warm")
@@ -43,6 +44,17 @@ class SalesTest(unittest.TestCase):
         self.assertEqual(len(leads), 1)
         self.assertEqual(leads[0]["username"], "romromflowers")
         self.assertIn("+7 (999) 123-45-67", leads[0]["contact"])
+
+    def test_cleans_seo_title_and_extracts_website(self):
+        self.assertEqual(clean_business_name(
+            "Адреса магазинов - Весна - Доставка цветов в Санкт-Петербурге",
+            "https://vesnabuket.ru/adresa-magazinov/",
+        ), "Весна")
+        with tempfile.TemporaryDirectory() as directory:
+            lead = LeadStore(directory + "/sales.db").add(
+                "Весна", contact="+7 (904) 215-91-35 · https://vesnabuket.ru/adresa-magazinov/"
+            )
+            self.assertEqual(website_link(lead), "https://vesnabuket.ru/adresa-magazinov/")
 
     def test_infers_search_folder_from_model_uri(self):
         from unittest.mock import patch
