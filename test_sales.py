@@ -1,8 +1,9 @@
 import tempfile
 import unittest
 
-from sales import (LeadStore, classify, clean_business_name, contact_link, draft_for, lead_display_name,
-                   normalize_username, parse_search_results, website_link, yandex_folder_id)
+from sales import (LeadStore, classify, clean_business_name, contact_link, demo_fallback, draft_for,
+                   lead_display_name, normalize_username, parse_search_results, website_link,
+                   yandex_folder_id)
 
 
 class SalesTest(unittest.TestCase):
@@ -27,13 +28,21 @@ class SalesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             lead = LeadStore(directory + "/sales.db").add("RomRom", "@RomRomShop", "СПб")
             self.assertEqual(normalize_username("https://t.me/RomRomShop"), "romromshop")
-            self.assertIn("короткое живое демо", draft_for(lead))
+            self.assertIn("прямо в этом чате включить демо-режим", draft_for(lead))
             self.assertIn("Меня зовут Сергей", draft_for(lead))
             self.assertIn("mrsergeyesmirnov-svg.github.io", draft_for(lead))
             self.assertNotIn("amoCRM", draft_for(lead))
             self.assertTrue(contact_link(lead).startswith("https://t.me/romromshop?text="))
             self.assertEqual(classify("Можно узнать стоимость и созвониться?"), "hot")
             self.assertEqual(classify("Покажите демо"), "warm")
+
+    def test_demo_state_and_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = LeadStore(directory + "/sales.db")
+            lead = store.add("RomRom", "romromshop")
+            self.assertEqual(lead.mode, "sales")
+            self.assertEqual(store.set_mode(lead.id, "demo").mode, "demo")
+            self.assertIn("Лавандовый вечер", demo_fallback("Пышный букет маме до 7000 без роз"))
 
     def test_parses_and_scores_yandex_results(self):
         raw = '''<?xml version="1.0" encoding="utf-8"?>
