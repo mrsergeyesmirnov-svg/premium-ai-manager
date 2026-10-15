@@ -1,7 +1,8 @@
 import tempfile
 import unittest
 
-from sales import (LeadStore, classify, clean_business_name, contact_link, demo_fallback, draft_for,
+from sales import (LeadStore, classify, clean_business_name, contact_link, demo_catalog_reply, demo_fallback,
+                   demo_wants_options, draft_for,
                    lead_display_name, normalize_username, parse_search_results, website_link,
                    yandex_folder_id)
 
@@ -43,6 +44,27 @@ class SalesTest(unittest.TestCase):
             self.assertEqual(lead.mode, "sales")
             self.assertEqual(store.set_mode(lead.id, "demo").mode, "demo")
             self.assertIn("Лавандовый вечер", demo_fallback("Пышный букет маме до 7000 без роз"))
+
+    def test_demo_shows_catalog_instead_of_promising_it(self):
+        history = [
+            {"role": "user", "text": "Хочу минималистичный букет с полевыми цветами до 7000"},
+            {"role": "assistant", "text": "Могу предложить несколько вариантов."},
+        ]
+        self.assertTrue(demo_wants_options("сам букет уже дай мне выбрать"))
+        reply = demo_catalog_reply(history, "сам букет уже дай мне выбрать")
+        self.assertIn("Белый шёлк", reply)
+        self.assertIn("Тёплое утро", reply)
+        self.assertIn("Точного букета из полевых цветов", reply)
+        self.assertNotIn("могу показать", reply.lower())
+
+    def test_clear_history_starts_demo_cleanly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = LeadStore(directory + "/sales.db")
+            lead = store.add("RomRom", "romromshop")
+            store.record(lead.id, "in", "старый разговор")
+            store.clear_history(lead.id)
+            self.assertEqual(store.history(lead.id), [])
+            self.assertEqual(store.get(lead.id).last_message, "")
 
     def test_parses_and_scores_yandex_results(self):
         raw = '''<?xml version="1.0" encoding="utf-8"?>
