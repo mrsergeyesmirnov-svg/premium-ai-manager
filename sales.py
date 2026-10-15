@@ -207,6 +207,11 @@ class LeadStore:
             db.execute("UPDATE leads SET mode=?, paused=0, updated_at=CURRENT_TIMESTAMP WHERE id=?", (mode, lead_id))
         return self.get(lead_id)
 
+    def clear_history(self, lead_id: int) -> None:
+        with self.connect() as db:
+            db.execute("DELETE FROM messages WHERE lead_id=?", (lead_id,))
+            db.execute("UPDATE leads SET last_message='', updated_at=CURRENT_TIMESTAMP WHERE id=?", (lead_id,))
+
     def setting(self, key: str, default: str = "") -> str:
         with self.connect() as db:
             row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
@@ -493,14 +498,72 @@ DEMO_CATALOG = """Учебный магазин «Тихий сад», Санк�
 как покупатель заинтересовался конкретным дополнением: ваза — 1 500 ₽, конфеты — 900 ₽.
 """
 
+DEMO_ITEMS = (
+    ("Белый шёлк", 4900, "7 эустом и эвкалипт", "воздушный и сдержанный"),
+    ("Тёплое утро", 5900, "5 кустовых хризантем, 4 эустомы и эвкалипт", "кремовый и мягкий"),
+    ("Лавандовый вечер", 6900, "3 гортензии и 5 эустом", "сиреневый, объёмный и нежный"),
+    ("Розовый акцент", 7900, "11 роз и эвкалипт", "классический и романтичный"),
+    ("Графика", 8900, "антуриумы и декоративная зелень", "современный и выразительный"),
+    ("Большое чувство", 12900, "5 гортензий, 7 эустом и эвкалипт", "пышный и торжественный"),
+)
+
+
+def demo_wants_options(text: str) -> bool:
+    normalized = text.lower().replace("ё", "е").strip()
+    return normalized in {"да", "ага", "давай", "хорошо", "покажи", "покажите"} or bool(re.search(
+        r"\b(покаж\w*|предлож\w*|вариант\w*|выбрать|выбер\w*|сам букет|дай\s+.*букет)", normalized
+    ))
+
+
+def demo_catalog_reply(history: list[dict], text: str) -> str:
+    context = " ".join([item.get("text", "") for item in history[-8:]] + [text]).lower().replace("ё", "е")
+    budget_matches = re.findall(r"(?<!\d)(\d{1,3}(?:[ .]\d{3})+|\d{4,6}|\d{1,2})\s*(?:тыс\w*|к|₽|руб\w*)?", context)
+    budget = None
+    for raw in budget_matches:
+        number = int(raw.replace(" ", "").replace(".", ""))
+        if number < 100:
+            number *= 1000
+        if 3000 <= number <= 100000:
+            budget = number
+
+    items = list(DEMO_ITEMS)
+    if "без роз" in context or "не люблю роз" in context:
+        items = [item for item in items if item[0] != "Розовый акцент"]
+    if budget:
+        affordable = [item for item in items if item[1] <= budget]
+        if affordable:
+            items = affordable
+
+    if any(word in context for word in ("пыш", "объем", "объём")):
+        order = {"Лавандовый вечер": 0, "Большое чувство": 1, "Тёплое утро": 2}
+    elif any(word in context for word in ("минимал", "полев", "сдержан")):
+        order = {"Белый шёлк": 0, "Тёплое утро": 1, "Лавандовый вечер": 2}
+    elif "роз" in context and "без роз" not in context:
+        order = {"Розовый акцент": 0, "Лавандовый вечер": 1, "Большое чувство": 2}
+    else:
+        order = {"Тёплое утро": 0, "Лавандовый вечер": 1, "Белый шёлк": 2}
+    items.sort(key=lambda item: (order.get(item[0], 20), item[1]))
+    items = items[:3]
+
+    prefix = ""
+    if "полев" in context:
+        prefix = ("Точного букета из полевых цветов в учебном ассортименте сейчас нет, поэтому не буду "
+                  "обещать то, чего нет. Ближе всего по настроению:\n\n")
+    lines = [f"{index}. «{name}» — {price:,} ₽. {composition}. {style.capitalize()}.".replace(f"{price:,}", f"{price:,}".replace(",", " "))
+             for index, (name, price, composition, style) in enumerate(items, 1)]
+    return prefix + "\n\n".join(lines) + "\n\nКакой ближе — 1, 2 или 3?"
+
 
 async def demo_reply(history: list[dict], text: str) -> str:
+    if demo_wants_options(text):
+        return demo_catalog_reply(history, text)
     prompt = f"""Ты онлайн-флорист учебного магазина. Это демонстрация для владельца цветочного бизнеса.
 {DEMO_CATALOG}
 
 Общайся по-русски, тепло, уверенно и естественно, без канцелярита и навязчивости. Обычно пиши 2–5 предложений.
-Сначала пойми запрос, затем задай только один действительно нужный вопрос. Учитывай повод, получателя, бюджет,
-нежелательные цветы, дату и способ получения. Не повторяй уже полученные сведения.
+Веди покупателя к выбору, а не поддерживай бесконечную беседу. Выясняй сведения по одному: сначала повод или
+получатель, затем бюджет, затем стиль/цвет и исключения. Задавай один короткий конкретный вопрос за сообщение,
+запоминай ответы и не спрашивай уже известное. Как только данных достаточно — сразу показывай 2–3 букета.
 Предлагай максимум три подходящих варианта только из каталога и кратко объясняй разницу между ними.
 Не придумывай наличие, цены, фотографии и составы. Если просят изменить состав или количество цветов,
 скажи, что это потребует подтверждения флориста, и предложи ближайший вариант из каталога.
@@ -510,6 +573,10 @@ async def demo_reply(history: list[dict], text: str) -> str:
 предложи использовать вымышленные имя, телефон и адрес. Деньги не принимай, ссылку на оплату не давай.
 В финале собери короткое «Учебное резюме заказа» и обязательно скажи, что заказ и оплата не создавались.
 Если спросят, честно скажи, что это демо онлайн-флориста Сергея, работающее через Яндекс API.
+Никогда не обещай действие на следующее сообщение: если говоришь, что покажешь варианты, покажи их сразу.
+Не используй пустые фразы «Отлично, я понял ваш запрос», «Хотите узнать больше», «Что бы вы хотели обсудить»
+или «Я могу показать». На короткое согласие «да», просьбу «покажи», «дай выбрать» сразу выдай конкретные позиции
+с названием, точной ценой и составом — не задавай вместо этого ещё один вопрос.
 """
     if not ai_enabled():
         return demo_fallback(text)
