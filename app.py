@@ -11,8 +11,9 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 
 from sales import (Lead, LeadStore, RANK, ai_enabled, classify, contact_link,
-                   declined, discover_florists, draft_for, lead_display_name, needs_handoff, phone_number,
-                   sales_reply, state_for, website_link)
+                   declined, demo_fallback, demo_reply, demo_should_summarize, discover_florists,
+                   draft_for, lead_display_name, needs_handoff, phone_number, sales_reply, state_for,
+                   website_link)
 
 
 async def telegram_api(method: str, payload: dict, timeout: float = 15):
@@ -128,7 +129,8 @@ async def send_business_message(message: BusinessMessage, text: str) -> None:
 def lead_line(lead: Lead) -> str:
     handle = f"@{lead.username}" if lead.username else phone_number(lead) or "без Telegram"
     paused = " · ручной режим" if lead.paused else ""
-    return f"#{lead.id} · {lead.status.upper()}{paused}\n{lead_display_name(lead)} · {handle} · {lead.city or 'город не указан'}"
+    mode = " · ДЕМО" if lead.mode == "demo" else ""
+    return f"#{lead.id} · {lead.status.upper()}{mode}{paused}\n{lead_display_name(lead)} · {handle} · {lead.city or 'город не указан'}"
 
 
 def parse_id(text: str) -> int | None:
@@ -146,6 +148,8 @@ HELP = """Продажи цветочным магазинам
 /lead ID — карточка и последнее сообщение
 /pause ID — отключить автоответы
 /resume ID — вернуть автоответы
+/demo ID — переключить этот чат в демо онлайн-флориста
+/sales ID — вернуть чат в режим обсуждения продукта
 
 Первое холодное сообщение бот не отправляет сам: /draft даёт текст и кнопку перехода в чат."""
 
@@ -213,6 +217,32 @@ async def process_admin_message(update: dict) -> dict[str, bool]:
         lead_id = parse_id(text) or 0
         lead = store.set_state(lead_id, paused=text.startswith("/pause ")) if store.get(lead_id) else None
         payload["text"] = ("Автоответы остановлены." if lead and lead.paused else "Автоответы включены.") if lead else "Лид не найден."
+    elif text == "/demo":
+        payload["text"] = ("Укажите номер лида: /demo ID\n\nПосле команды этот же диалог станет демо-магазином. "
+                           "Человек сможет написать как покупатель. Вернуть обычный режим: /sales ID")
+    elif text.startswith("/demo "):
+        lead_id = parse_id(text) or 0
+        lead = store.set_mode(lead_id, "demo")
+        if lead:
+            store.set_setting(f"demo_summary_{lead.id}", "0")
+        if not lead:
+            payload["text"] = "Лид не найден."
+        elif not lead.chat_id or not lead.business_connection_id:
+            payload["text"] = ("Демо-режим установлен, но Telegram ещё не связал этот контакт с диалогом. "
+                               "Попросите человека сначала ответить вам, затем повторите команду.")
+        else:
+            intro = ("Спасибо! Я включил демо-режим прямо в этом чате. Теперь можете написать как обычный "
+                     "покупатель — например: «Нужен пышный букет маме до 7 000 ₽, без роз».\n\n"
+                     "Магазин, ассортимент и цены учебные; настоящий заказ и оплата не создаются.")
+            await telegram_api("sendMessage", {"business_connection_id": lead.business_connection_id,
+                                                "chat_id": lead.chat_id, "text": intro})
+            store.record(lead.id, "out", intro)
+            payload["text"] = (f"Демо включено для #{lead.id}. В этот же чат отправлено приглашение.\n"
+                               f"Вернуть обсуждение продукта: /sales {lead.id}")
+    elif text.startswith("/sales "):
+        lead_id = parse_id(text) or 0
+        lead = store.set_mode(lead_id, "sales")
+        payload["text"] = (f"#{lead.id} возвращён в режим обсуждения продукта." if lead else "Лид не найден.")
     elif text.startswith("/lead "):
         lead = store.get(parse_id(text) or 0)
         payload["text"] = (lead_line(lead) + f"\n\nЗаметка: {lead.note or '—'}\nПоследнее: {lead.last_message or '—'}") if lead else "Лид не найден."
@@ -258,7 +288,27 @@ async def process_update(update: dict) -> dict[str, bool]:
         cached = state.replies.get(message.message_id) if message.message_id is not None else None
         if cached and cached[1]:
             return {"ok": True}
-        if not cached:
+        if not cached and lead.mode == "demo":
+            store.record(lead.id, "in", message.text)
+            history = store.history(lead.id)
+            started = time.monotonic()
+            try:
+                reply = await demo_reply(history[:-1], message.text)
+            except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError):
+                reply = demo_fallback(message.text)
+            store.record(lead.id, "out", reply)
+            if message.message_id is not None:
+                state.replies[message.message_id] = (reply, False)
+            await asyncio.sleep(max(0, min(9, 4.5 + len(reply) / 320) - (time.monotonic() - started)))
+            summary_key = f"demo_summary_{lead.id}"
+            if demo_should_summarize(message.text, history) and store.setting(summary_key) != "1":
+                transcript = "\n".join(
+                    ("Покупатель: " if item["role"] == "user" else "Флорист: ") + item["text"]
+                    for item in history[-8:]
+                )
+                await notify_admin(f"🧪 ДЕМО: клиент дошёл до выбора\n{lead_line(lead)}\n\n{transcript[:3000]}")
+                store.set_setting(summary_key, "1")
+        elif not cached:
             store.record(lead.id, "in", message.text)
             incoming_status = classify(message.text)
             status = incoming_status if RANK[incoming_status] > RANK[lead.status] else lead.status
@@ -281,7 +331,7 @@ async def process_update(update: dict) -> dict[str, bool]:
             state.replies[message.message_id] = (reply, True)
             if len(state.replies) > 50:
                 del state.replies[next(iter(state.replies))]
-        if lead.status in ("warm", "hot"):
+        if lead.mode == "sales" and lead.status in ("warm", "hot"):
             marker = "🔥 ГОРЯЧИЙ" if lead.status == "hot" else "🟡 ТЁПЛЫЙ"
             action = f"\nАвтоответы остановлены. /resume {lead.id}" if lead.paused else ""
             await notify_admin(f"{marker}\n{lead_line(lead)}\n\n{message.text[:1500]}{action}")
