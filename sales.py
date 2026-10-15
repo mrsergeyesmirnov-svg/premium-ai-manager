@@ -48,6 +48,7 @@ class Lead:
     business_connection_id: str
     paused: bool
     last_message: str
+    mode: str
 
 
 class LeadStore:
@@ -81,7 +82,16 @@ class LeadStore:
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS leads_username_unique
                     ON leads(username) WHERE username <> '';
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
             """)
+            try:
+                db.execute("ALTER TABLE leads ADD COLUMN mode TEXT NOT NULL DEFAULT 'sales'")
+            except sqlite3.OperationalError as error:
+                if "duplicate column name" not in str(error).lower():
+                    raise
 
     def connect(self):
         db = sqlite3.connect(self.path, timeout=10)
@@ -190,6 +200,43 @@ class LeadStore:
                 db.execute(f"UPDATE leads SET {', '.join(fields)}, updated_at=CURRENT_TIMESTAMP WHERE id=?", values)
         return self.get(lead_id)
 
+    def set_mode(self, lead_id: int, mode: str) -> Lead | None:
+        if mode not in ("sales", "demo") or not self.get(lead_id):
+            return None
+        with self.connect() as db:
+            db.execute("UPDATE leads SET mode=?, paused=0, updated_at=CURRENT_TIMESTAMP WHERE id=?", (mode, lead_id))
+        return self.get(lead_id)
+
+    def setting(self, key: str, default: str = "") -> str:
+        with self.connect() as db:
+            row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self.connect() as db:
+            db.execute("INSERT INTO settings(key, value) VALUES (?, ?) "
+                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+    def start_demo(self, chat_id: int, username: str, display_name: str, connection_id: str) -> Lead:
+        username = normalize_username(username)
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM leads WHERE chat_id=?", (chat_id,)).fetchone()
+            if row is None and username:
+                row = db.execute("SELECT * FROM leads WHERE username=?", (username,)).fetchone()
+            if row is None:
+                cursor = db.execute(
+                    "INSERT INTO leads(name, username, contact, note, chat_id, business_connection_id, mode) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'demo')",
+                    ((display_name or "Участник демо")[:200], username, f"@{username}" if username else "",
+                     "Самостоятельный вход в демо", chat_id, connection_id),
+                )
+                row = db.execute("SELECT * FROM leads WHERE id=?", (cursor.lastrowid,)).fetchone()
+            else:
+                db.execute("UPDATE leads SET chat_id=?, business_connection_id=?, mode='demo', paused=0, "
+                           "updated_at=CURRENT_TIMESTAMP WHERE id=?", (chat_id, connection_id, row["id"]))
+                row = db.execute("SELECT * FROM leads WHERE id=?", (row["id"],)).fetchone()
+        return self._lead(row)
+
 
 def classify(text: str) -> str:
     text = text.lower().replace("ё", "е")
@@ -219,8 +266,9 @@ def draft_for(lead: Lead) -> str:
         "Помощник может уточнить повод, бюджет и пожелания, подобрать варианты из ассортимента магазина и передать "
         "сотруднику уже понятный запрос. Например, он пригодится, когда человек пишет вечером, просит «пышный букет "
         "маме до 7 000 ₽ без роз» или долго выбирает и уходит без заказа.\n\n"
-        "Сейчас я хочу показать идею нескольким магазинам и получить честную обратную связь. Можно я пришлю вам "
-        "короткое живое демо?\n\n"
+        "Сейчас я хочу показать идею нескольким магазинам и получить честную обратную связь. Если вам интересно, "
+        "я могу прямо в этом чате включить демо-режим: вы напишете как обычный покупатель и сами проверите, "
+        "как помощник подбирает букет и ведёт к заказу. Хотите попробовать?\n\n"
         "Если захотите сначала понять, кто я: https://mrsergeyesmirnov-svg.github.io/smirnovsergey/?v=5"
     )
 
@@ -371,6 +419,8 @@ async def ai_reply(lead: Lead, history: list[dict], text: str) -> str:
 Не выдумывай отзывы, клиентов, кейсы, скидки, функции и договорённости.
 Продукт: AI-менеджер в Telegram Business, ответы по ассортименту магазина, квалификация лида,
 передача живому сотруднику, сохранение заявок; amoCRM и другие каналы подключаются после изучения текущих интеграций.
+Если человек хочет демо, объясни: Сергей может переключить этот же чат в режим учебного цветочного магазина,
+после чего человек сможет написать как обычный покупатель. Не предлагай отдельную ссылку или другого бота.
 Примеры пользы: ответить вечером или во время загрузки менеджера; понять свободный запрос вроде
 «пышный букет маме до 7 000 ₽ без роз»; подобрать варианты из актуального ассортимента; уточнить доставку;
 вернуть клиента, который выбирал, но не закончил заказ; вовремя передать сложный или дорогой запрос человеку.
@@ -412,9 +462,9 @@ def fallback_reply(text: str) -> str:
                 "и сейчас развивает онлайн-флориста. Вот его личный сайт: "
                 "https://mrsergeyesmirnov-svg.github.io/smirnovsergey/?v=5")
     if any(word in normalized for word in ("демо", "покаж", "интерес", "подробнее")):
-        return ("Конечно. В демо можно написать обычный запрос покупателя — например, попросить пышный букет маме "
-                "до 7 000 ₽ без роз. Помощник уточнит детали, подберёт варианты и при необходимости передаст разговор "
-                "человеку. Прислать ссылку?")
+        return ("Конечно. Сергей может переключить прямо этот чат в демо-режим цветочного магазина. После этого "
+                "вы сможете написать как обычный покупатель — например, попросить пышный букет маме до 7 000 ₽ "
+                "без роз — и самостоятельно пройти весь диалог. Включить демо?")
     return ("Спасибо, что ответили. Я постараюсь помочь по существу, без навязчивых предложений. "
             "Расскажите, пожалуйста, что в идее вызывает у вас вопрос или сомнение?")
 
@@ -426,6 +476,75 @@ async def sales_reply(lead: Lead, history: list[dict], text: str) -> str:
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError):
             pass
     return fallback_reply(text)
+
+
+DEMO_CATALOG = """Учебный магазин «Тихий сад», Санкт-Петербург. Ежедневно 09:00–22:00.
+Самовывоз бесплатный, доставка по городу 700 ₽.
+
+Актуальный учебный ассортимент:
+1. «Белый шёлк» — 4 900 ₽: 7 эустом и эвкалипт. Белый, воздушный, сдержанный.
+2. «Тёплое утро» — 5 900 ₽: 5 кустовых хризантем, 4 эустомы и эвкалипт. Кремовый и мягкий.
+3. «Лавандовый вечер» — 6 900 ₽: 3 гортензии и 5 эустом. Сиреневый, объёмный, нежный.
+4. «Розовый акцент» — 7 900 ₽: 11 роз и эвкалипт. Классический и романтичный.
+5. «Графика» — 8 900 ₽: антуриумы и декоративная зелень. Современный и выразительный.
+6. «Большое чувство» — 12 900 ₽: 5 гортензий, 7 эустом и эвкалипт. Пышный и торжественный.
+
+Открытка и упаковка включены. Дополнительно доступны ваза и конфеты. Их цену называй только после того,
+как покупатель заинтересовался конкретным дополнением: ваза — 1 500 ₽, конфеты — 900 ₽.
+"""
+
+
+async def demo_reply(history: list[dict], text: str) -> str:
+    prompt = f"""Ты онлайн-флорист учебного магазина. Это демонстрация для владельца цветочного бизнеса.
+{DEMO_CATALOG}
+
+Общайся по-русски, тепло, уверенно и естественно, без канцелярита и навязчивости. Обычно пиши 2–5 предложений.
+Сначала пойми запрос, затем задай только один действительно нужный вопрос. Учитывай повод, получателя, бюджет,
+нежелательные цветы, дату и способ получения. Не повторяй уже полученные сведения.
+Предлагай максимум три подходящих варианта только из каталога и кратко объясняй разницу между ними.
+Не придумывай наличие, цены, фотографии и составы. Если просят изменить состав или количество цветов,
+скажи, что это потребует подтверждения флориста, и предложи ближайший вариант из каталога.
+Допродажу предлагай мягко только после выбора букета. Сначала назови дополнения без цен; цену сообщай,
+только если человек заинтересовался. Не предлагай несколько дополнений повторно.
+Когда вариант выбран, уточни дату/время и доставку или самовывоз. Не проси настоящие персональные данные:
+предложи использовать вымышленные имя, телефон и адрес. Деньги не принимай, ссылку на оплату не давай.
+В финале собери короткое «Учебное резюме заказа» и обязательно скажи, что заказ и оплата не создавались.
+Если спросят, честно скажи, что это демо онлайн-флориста Сергея, работающее через Яндекс API.
+"""
+    if not ai_enabled():
+        return demo_fallback(text)
+    async with httpx.AsyncClient(timeout=25) as client:
+        response = await client.post(
+            "https://llm.api.cloud.yandex.net/foundationModels/v1/completion",
+            headers={"Authorization": "Api-Key " + os.environ["YANDEX_API_KEY"],
+                     "x-data-logging-enabled": "false"},
+            json={"modelUri": os.environ["YANDEX_MODEL_URI"],
+                  "completionOptions": {"stream": False, "temperature": 0.35, "maxTokens": "650"},
+                  "messages": [{"role": "system", "text": prompt}] + history[-16:] +
+                              [{"role": "user", "text": text[:2000]}]},
+        )
+        response.raise_for_status()
+        answer = response.json()["result"]["alternatives"][0]["message"]["text"].strip()
+        if not answer:
+            raise ValueError("empty model response")
+        return answer[:3500]
+
+
+def demo_fallback(text: str) -> str:
+    normalized = text.lower().replace("ё", "е")
+    if any(word in normalized for word in ("заказ", "оформ", "беру", "подходит")):
+        return ("Отлично, зафиксируем выбранный букет. Подскажите, пожалуйста, это будет доставка или самовывоз? "
+                "Для демо используйте только вымышленные контактные данные — настоящий заказ не создаётся.")
+    if any(word in normalized for word in ("мам", "пыш", "7000", "7 000", "без роз")):
+        return ("Для такого запроса я бы предложил «Лавандовый вечер» за 6 900 ₽: три гортензии и пять эустом, "
+                "букет получается объёмным и нежным. Роз в составе нет. Как вам сиреневая гамма?")
+    return ("Здравствуйте! Это демо онлайн-флориста магазина «Тихий сад». Расскажите, пожалуйста, для кого "
+            "вы выбираете букет и на какой бюджет ориентируетесь?")
+
+
+def demo_should_summarize(text: str, history: list[dict]) -> bool:
+    normalized = text.lower().replace("ё", "е")
+    return bool(re.search(r"\b(оформ|заказ|беру|подходит|достав|самовывоз|адрес|оплат)\w*", normalized)) or len(history) >= 10
 
 
 @dataclass
