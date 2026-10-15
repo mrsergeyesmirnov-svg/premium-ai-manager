@@ -51,7 +51,7 @@ class FlowTest(unittest.IsolatedAsyncioTestCase):
             await process_admin_message({"message": {"chat": {"id": 100, "type": "private"}, "from": {"id": 100},
                                                      "text": f"/draft {lead.id}"}})
             self.assertIn("inline_keyboard", api.call_args.args[1]["reply_markup"])
-            self.assertIn("короткое живое демо", api.call_args.args[1]["text"])
+            self.assertIn("прямо в этом чате включить демо-режим", api.call_args.args[1]["text"])
 
     async def test_known_lead_gets_reply_and_hot_alert(self):
         lead = self.store.add("RomRom", "romromshop", "СПб")
@@ -79,6 +79,30 @@ class FlowTest(unittest.IsolatedAsyncioTestCase):
             await process_update(payload)
             send.assert_not_awaited()
             notify.assert_awaited_once()
+
+    async def test_demo_switches_existing_chat_to_florist(self):
+        lead = self.store.add("RomRom", "romromshop", "СПб")
+        self.store.match(42, "romromshop", "bc")
+        with patch.dict(os.environ, {"ADMIN_CHAT_ID": "100", "ALLOWED_CHAT_IDS": "*",
+                                     "YANDEX_API_KEY": "", "YANDEX_MODEL_URI": ""}), \
+                patch("app.get_store", return_value=self.store), \
+                patch("app.telegram_api", new_callable=AsyncMock) as api:
+            await process_admin_message({"message": {"chat": {"id": 100, "type": "private"},
+                                                       "from": {"id": 100}, "text": f"/demo {lead.id}"}})
+            self.assertEqual(self.store.get(lead.id).mode, "demo")
+            self.assertIn("демо-режим", api.await_args_list[0].args[1]["text"])
+
+        payload = {"business_message": {
+            "message_id": 2, "business_connection_id": "bc", "chat": {"id": 42, "type": "private"},
+            "from": {"id": 42, "username": "romromshop"}, "text": "Букет маме до 7000 без роз",
+        }}
+        with patch.dict(os.environ, {"ADMIN_CHAT_ID": "100", "ALLOWED_CHAT_IDS": "*",
+                                     "YANDEX_API_KEY": "", "YANDEX_MODEL_URI": ""}), \
+                patch("app.get_store", return_value=self.store), \
+                patch("app.send_business_message", new_callable=AsyncMock) as send, \
+                patch("app.asyncio.sleep", new_callable=AsyncMock):
+            await process_update(payload)
+            self.assertIn("Лавандовый вечер", send.await_args.args[1])
 
 
 class StartupTest(unittest.IsolatedAsyncioTestCase):
