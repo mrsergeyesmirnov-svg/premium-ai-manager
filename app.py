@@ -224,6 +224,7 @@ async def process_admin_message(update: dict) -> dict[str, bool]:
         lead_id = parse_id(text) or 0
         lead = store.set_mode(lead_id, "demo")
         if lead:
+            store.clear_history(lead.id)
             store.set_setting(f"demo_summary_{lead.id}", "0")
         if not lead:
             payload["text"] = "Лид не найден."
